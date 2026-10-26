@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""NBA Oracle Backtest v2: Elo + recent team form + player-box-score features.
+"""NBA Oracle Backtest v3: team form + player-specific rolling rotation proxies.
 
-The added features are rolling team aggregates of player box scores from prior
-games only. They are not individual-player identity or injury/availability
-features. Models are trained on seasons strictly earlier than the season tested.
+Player identity, minutes and production features use prior appearances only.
+Recent participation is a rotation proxy, NOT a verified injury or lineup feed.
+Models are trained on seasons strictly earlier than the season tested.
 """
 from __future__ import annotations
 
@@ -125,7 +125,8 @@ def reconstruct_games(players):
         "limitations": [
             "Seven regular-season games are missing in the source for 2024-25.",
             "Scores are reconstructed by summing player points and are not independently verified against official box scores.",
-            "Added features are rolling team aggregates of player box scores, not individual player identities or injury/availability data.",
+            "Player rotation features use player identity and prior minutes/production; recent participation is only a proxy, not a verified injury or lineup feed.",
+            "No historical injury reports, confirmed starting lineups or true DNP/inactive labels are available in this source.",
             "No historical injuries, confirmed lineups, betting odds, shot charts, play-by-play or tracking data."
         ]
     }
@@ -211,6 +212,101 @@ def build_features(games):
     return pd.DataFrame(rows)
 
 
+def build_player_rotation_features(players, games):
+    """Create leakage-safe player-identity/rotation features from prior appearances."""
+    identity = "player_id" if "player_id" in players.columns else "player_name"
+    if identity not in players.columns:
+        log("Aucun identifiant joueur disponible: les features rotation sont désactivées")
+        return pd.DataFrame({"game_id": games.game_id.astype(str)})
+
+    required = ["game_id", "team", identity, "game_date"]
+    missing = [c for c in required if c not in players.columns]
+    if missing:
+        log(f"Colonnes joueur manquantes {missing}: features rotation désactivées")
+        return pd.DataFrame({"game_id": games.game_id.astype(str)})
+
+    p = players.copy()
+    p["game_id"] = p.game_id.astype(str)
+    p["team"] = p.team.astype(str)
+    p[identity] = p[identity].astype(str)
+    p["game_date"] = pd.to_datetime(p.game_date, errors="coerce")
+    p = p.dropna(subset=["game_date", "game_id"])
+    for c in ("minutes", "pts", "reb", "ast"):
+        if c not in p:
+            p[c] = 0.0
+        p[c] = pd.to_numeric(p[c], errors="coerce").fillna(0.0)
+
+    player_games = p.groupby(["game_id", "team", identity, "game_date"], as_index=False)[
+        ["minutes", "pts", "reb", "ast"]].sum()
+    by_game = {gid: grp for gid, grp in player_games.groupby("game_id", sort=False)}
+    # The same date can contain many games. All features are generated before any
+    # player records from that game are added to histories.
+    player_hist = defaultdict(lambda: deque(maxlen=10))
+    team_game_hist = defaultdict(lambda: deque(maxlen=5))
+    team_last_date = {}
+    feature_rows = []
+
+    for g in games.sort_values(["date", "game_id"], kind="stable").itertuples(index=False):
+        gid, date = str(g.game_id), pd.Timestamp(g.date)
+        this = by_game.get(gid, pd.DataFrame(columns=["team", identity, "minutes", "pts", "reb", "ast"]))
+        team_features = {}
+        for side, team in (("home", str(g.home_team)), ("away", str(g.away_team))):
+            roster = []
+            for pid, history in player_hist.items():
+                # Histories are keyed by (team, player identity), preventing team-switch leakage.
+                if pid[0] != team or not history:
+                    continue
+                recent = list(history)
+                last = recent[-1]
+                age = (date - last["date"]).days
+                # Do not treat a player from a distant prior stint/season as current rotation.
+                if age < 0 or age > 45:
+                    continue
+                mins = float(np.mean([x["minutes"] for x in recent[-5:]]))
+                pts = float(np.mean([x["pts"] for x in recent[-5:]]))
+                reb = float(np.mean([x["reb"] for x in recent[-5:]]))
+                ast = float(np.mean([x["ast"] for x in recent[-5:]]))
+                # Played in one of the last three team games = recent participation proxy.
+                recent_dates = set(list(team_game_hist[team])[-3:])
+                recently_seen = int(last["date"] in recent_dates)
+                roster.append({"mins": mins, "pts": pts, "reb": reb, "ast": ast,
+                               "age": age, "recent": recently_seen,
+                               "last_minutes": float(last["minutes"])})
+            roster.sort(key=lambda x: x["mins"], reverse=True)
+            top5, top8 = roster[:5], roster[:8]
+            active_proxy = [x for x in roster if x["recent"] and x["age"] <= 14]
+            def total(items, key): return float(sum(x[key] for x in items))
+            team_features[side] = {
+                "expected_minutes_top5": total(top5, "mins"),
+                "expected_minutes_top8": total(top8, "mins"),
+                "expected_pts_top8": total(top8, "pts"),
+                "expected_reb_top8": total(top8, "reb"),
+                "expected_ast_top8": total(top8, "ast"),
+                "recent_rotation_count": float(len(active_proxy)),
+                "recent_rotation_minutes": total(active_proxy, "mins"),
+                "minutes_top5_share": total(top5, "mins") / max(total(roster, "mins"), 1.0),
+                "players_with_history": float(len(roster)),
+            }
+        row = {"game_id": gid}
+        for key in team_features["home"]:
+            row[f"{key}_diff"] = team_features["home"][key] - team_features["away"][key]
+        feature_rows.append(row)
+
+        # Update only after features for both teams have been calculated.
+        if not this.empty:
+            for rec in this.itertuples(index=False):
+                team = str(rec.team)
+                pid = (team, str(getattr(rec, identity)))
+                player_hist[pid].append({"date": date, "minutes": float(rec.minutes),
+                                         "pts": float(rec.pts), "reb": float(rec.reb),
+                                         "ast": float(rec.ast)})
+            for team in (str(g.home_team), str(g.away_team)):
+                team_game_hist[team].append(date)
+                team_last_date[team] = date
+
+    return pd.DataFrame(feature_rows).drop_duplicates("game_id")
+
+
 F5 = ["home_margin_5","away_margin_5","home_winrate_5","away_winrate_5",
       "home_pts_for_5","away_pts_for_5","home_pts_against_5","away_pts_against_5",
       "rest_diff","home_b2b","away_b2b"]
@@ -219,6 +315,11 @@ F20 = [x.replace("_5", "_20") for x in F5[:8]] + F5[8:]
 FULL = ["elo_diff"] + F5[:8] + F10[:8] + F20[:8] + F5[8:]
 PLAYER_FEATURES = [f"{s}_diff_{w}" for w in (5,10) for s in ROLL_STATS]
 PLAYER_FEATURES += [f"efg_diff_{w}" for w in (5,10)] + [f"ft_rate_diff_{w}" for w in (5,10)]
+ROTATION_FEATURES = ["expected_minutes_top5_diff", "expected_minutes_top8_diff",
+                     "expected_pts_top8_diff", "expected_reb_top8_diff",
+                     "expected_ast_top8_diff", "recent_rotation_count_diff",
+                     "recent_rotation_minutes_diff", "minutes_top5_share_diff",
+                     "players_with_history_diff"]
 MODELS = {
     "baseline_home_58": None,
     "elo": "elo",
@@ -227,6 +328,7 @@ MODELS = {
     "logistic_form20": F20,
     "logistic_elo_form": FULL,
     "logistic_elo_player_form": FULL + PLAYER_FEATURES,
+    "logistic_elo_rotation_form": FULL + PLAYER_FEATURES + ROTATION_FEATURES,
 }
 
 
@@ -290,6 +392,14 @@ def main():
     players = load_players(Path(args.cache))
     games, audit = reconstruct_games(players)
     features = build_features(games)
+    rotation = build_player_rotation_features(players, games)
+    features["game_id"] = features["game_id"].astype(str)
+    rotation["game_id"] = rotation["game_id"].astype(str)
+    features = features.merge(rotation, on="game_id", how="left", validate="one_to_one")
+    for col in ROTATION_FEATURES:
+        if col not in features:
+            features[col] = 0.0
+        features[col] = pd.to_numeric(features[col], errors="coerce").fillna(0.0)
     pred = predict(features)
     overall, by_season = summarize(pred)
     out = Path(args.output)
@@ -298,7 +408,7 @@ def main():
     overall.to_csv(out / "summary_overall.csv", index=False)
     by_season.to_csv(out / "summary_by_season.csv", index=False)
     (out / "data_audit.json").write_text(json.dumps(audit, indent=2), encoding="utf-8")
-    lines = ["# NBA Oracle Backtest v2", "",
+    lines = ["# NBA Oracle Backtest v3", "",
              f"Matchs reconstruits : {audit['total_reconstructed_games']}", "",
              "## Résultats globaux", "",
              "| Modèle | Matchs | Précision | Brier | Log loss |",
